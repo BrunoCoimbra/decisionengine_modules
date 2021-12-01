@@ -6,7 +6,7 @@ from decisionengine_modules.glideinwms.tests.fixtures import de_client_config  #
 def test_instantiation(de_client_config):  # noqa: F811
     with de_client_config:
         config = DEConfigSource()
-        assert config["value"] == "foo"
+        assert config["frontend_name"] == "mock_frontend"
 
 
 def test_config_error():
