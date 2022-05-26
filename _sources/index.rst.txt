@@ -5,8 +5,8 @@ Welcome to decisionengine_modules' documentation!
 ==========================================
 
 The decisionengine_modules package contains provider specific
-implementations of base classes provided by the decision engine
-framework.
+implementations of base classes provided by the
+`decision engine framework </decisionengine/>`_.
 
 
 Release Notes
@@ -15,6 +15,7 @@ Release Notes
 .. toctree::
    :maxdepth: 1
 
+   release_notes/release_notes_2.0
    release_notes/release_notes_1.7
    release_notes/release_notes_1.6
    release_notes/release_notes_1.5
