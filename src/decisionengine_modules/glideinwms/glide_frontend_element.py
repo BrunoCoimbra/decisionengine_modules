@@ -17,6 +17,8 @@ from glideinwms.lib import pubCrypto, token_util
 from decisionengine_modules.glideinwms import classads
 from decisionengine_modules.glideinwms.security import Credential, CredentialCache
 
+from glideinwms.lib.credentials import CredentialPair, SecurityBundle, AuthenticationMethod, CredentialType
+
 pandas.options.mode.chained_assignment = None  # default='warn'
 
 
@@ -326,11 +328,11 @@ class GlideFrontendElement:
             glidein_monitors_per_cred = {}
             creds_with_running = 0
             for cred in self.credential_plugin.cred_list:
-                glidein_monitors_per_cred[cred.get_id()] = {
-                    f"Glideins{t}": count_slots_per_cred[cred.get_id()][t] for t in count_slots
+                glidein_monitors_per_cred[cred.id] = {
+                    f"Glideins{t}": count_slots_per_cred[cred.id][t] for t in count_slots
                 }
-                glidein_monitors_per_cred[cred.get_id()]["ScaledRunning"] = 0
-                if glidein_monitors_per_cred[cred.get_id()]["GlideinsRunning"]:
+                glidein_monitors_per_cred[cred.id]["ScaledRunning"] = 0
+                if glidein_monitors_per_cred[cred.id]["GlideinsRunning"]:
                     creds_with_running += 1
 
             if creds_with_running:
@@ -338,7 +340,7 @@ class GlideFrontendElement:
                 scaled = 0
                 tr = glidein_monitors["Running"]
                 for cred in self.credential_plugin.cred_list:
-                    cred_monitor = glidein_monitors_per_cred[cred.get_id()]
+                    cred_monitor = glidein_monitors_per_cred[cred.id]
                     if cred_monitor["GlideinsRunning"]:
                         # This cred has running, scale them down
                         if (creds_with_running - scaled) == 1:
@@ -438,7 +440,7 @@ class GlideFrontendElement:
         security_name=None,
         remove_excess_str=None,
         trust_domain="Any",
-        auth_method="Any",
+        auth_method=AuthenticationMethod("Any"),
         entry_name="condor",
         glidein_site="Unknown",
     ):
@@ -465,13 +467,7 @@ class GlideFrontendElement:
             remove_excess_str=remove_excess_str,
         )
 
-        # TODO: Filter by credential type once token/proxy hybrid configurations are no longer supported
-        # credential_type=auth_method
-        credentials_with_request = self.credential_plugin.get_credentials(
-            params_obj=params_obj, trust_domain=trust_domain
-        )
-
-        if not credentials_with_request:
+        if not self.request_credentials:
             raise NoCredentialException
 
         # There will one glideclient classad per glidefactory classad for
@@ -479,28 +475,35 @@ class GlideFrontendElement:
         # List of glideclient classad objects to return
         gc_classads = []
 
-        for cred in credentials_with_request:
-            if not cred.advertize:
+        auth_set = auth_method.match(self.credential_plugin.security_bundle)
+        if not auth_set:
+            self.logger.warning(
+                f"Credentials do not match auth method {auth_method} (for {params_obj.request_name}), aborting."
+            )
+            return
+        
+        # Assign work to the credentials per the plugin policy
+        self.credential_plugin.assign_work(self.request_credentials, params_obj, auth_set)
+
+        for req_cred in self.request_credentials:
+            if not req_cred.advertize:
                 self.logger.info(
-                    f"Ignoring credential with id: {cred.get_id()}, "
-                    f"pilot_proxy: {cred.pilot_fname}, type: {cred.type}, trust_domain: {cred.trust_domain}, security_name: {cred.security_class}, advertise: {cred.advertize}"
+                    f"Ignoring credential with id: {req_cred.credential.id}, "
+                    f"credential: {req_cred.credential.path}, type: {req_cred.credential.cred_type}, trust_domain: {req_cred.credential.trust_domain}, "
+                    f"security_name: {req_cred.credential.security_class}, advertise: {req_cred.advertize}"
                 )
                 # We have already determined that this cred cannot be used
                 continue
 
-            if not cred.supports_auth_method(auth_method):
-                # TODO: Remove this condition once token/proxy hybrid configurations are no longer supported
-                if auth_method == "grid_proxy" and "scitoken" in cred.type:
-                    self.logger.debug("Sending scitoken along with grid-proxy")
-                else:
-                    self.logger.warning(
-                        f"Credential {cred.type} does not match auth method {auth_method} (for {params_obj.request_name}), skipping..."
-                    )
-                    continue
-
-            if cred.trust_domain != trust_domain:
+            if not auth_set.supports(req_cred.credential.cred_type):
                 self.logger.warning(
-                    f"Credential {cred.trust_domain} does not match {trust_domain} (for {params_obj.request_name}) domain, skipping..."
+                    f"Credential {req_cred.type} does not match auth method {auth_method} (for {params_obj.request_name}), skipping..."
+                )
+                continue
+
+            if req_cred.credential.trust_domain != trust_domain:
+                self.logger.warning(
+                    f"Credential {req_cred.trust_domain} does not match {trust_domain} (for {params_obj.request_name}) domain, skipping..."
                 )
                 continue
 
@@ -509,12 +512,12 @@ class GlideFrontendElement:
                 glidein_params_to_encrypt = {}
             else:
                 glidein_params_to_encrypt = copy.deepcopy(glidein_params_to_encrypt)
-            req_idle, req_max_run = cred.get_usage_details()
+            req_idle, req_max_run = req_cred.get_usage_details()
             # TODO: Need to print this somewhere but currently logging this is interleaved with stats
             # self.logger.info('Advertizing credential %s with (%d idle, %d max run) for request %s' %
             # (cred.filename, req_idle, req_max_run, params_obj.request_name))
 
-            glidein_monitors_this_cred = params_obj.glidein_monitors_per_cred.get(cred.get_id(), {})
+            glidein_monitors_this_cred = params_obj.glidein_monitors_per_cred.get(req_cred.credential.id, {})
 
             # Create GlideClientClassad object
             my_name = f"{self.frontend_name}.{self.fe_group}"
@@ -522,7 +525,7 @@ class GlideFrontendElement:
             # Make the classad name unique by adding credential id to it
             gc_classad.adParams[
                 "Name"
-            ] = f"{self.file_id_cache.file_id(cred, cred.filename)}_{gc_classad.adParams['Name']}"
+            ] = f"{req_cred.credential.id}_{gc_classad.adParams['Name']}"
             gc_classad.adParams["CollectorHost"] = factory_pool
             gc_classad.adParams["FrontendName"] = self.frontend_name
             gc_classad.adParams["GroupName"] = self.fe_group
@@ -561,38 +564,17 @@ class GlideFrontendElement:
             gc_classad.adParams.update(monitor_attr)
 
             # Add security class and security name to encrypted params
-            glidein_params_to_encrypt["SecurityClass"] = str(cred.security_class)
+            glidein_params_to_encrypt["SecurityClass"] = str(req_cred.credential.security_class)
             glidein_params_to_encrypt["SecurityName"] = str(self.security_name)
 
             # Add id for all the credential files
-            if "username_password" in cred.type:
-                glidein_params_to_encrypt["Username"] = self.file_id_cache.file_id(cred, cred.filename)
-                glidein_params_to_encrypt["Password"] = self.file_id_cache.file_id(cred, cred.key_fname)
-            if "grid_proxy" in cred.type:
-                glidein_params_to_encrypt["SubmitProxy"] = self.file_id_cache.file_id(cred, cred.filename)
-            if "scitoken" in cred.type:
-                glidein_params_to_encrypt["frontend_scitoken"] = cred.loaded_data[0][1]
-            if "cert_pair" in cred.type:
-                glidein_params_to_encrypt["PublicCert"] = self.file_id_cache.file_id(cred, cred.filename)
-                glidein_params_to_encrypt["PrivateCert"] = self.file_id_cache.file_id(cred, cred.key_fname)
-            if "key_pair" in cred.type:
-                glidein_params_to_encrypt["PublicKey"] = self.file_id_cache.file_id(cred, cred.filename)
-                glidein_params_to_encrypt["PrivateKey"] = self.file_id_cache.file_id(cred, cred.key_fname)
-            if "vm_id" in cred.type:
-                glidein_params_to_encrypt["VMId"] = str(cred.vm_id)
-            if "vm_type" in cred.type:
-                glidein_params_to_encrypt["VMType"] = str(cred.vm_type)
-            if "remote_username" in cred.type:
-                glidein_params_to_encrypt["RemoteUsername"] = self.file_id_cache.file_id(cred, cred.remote_username)
-            if "auth_file" in cred.type:
-                glidein_params_to_encrypt["AuthFile"] = self.file_id_cache.file_id(cred, cred.filename)
-            if cred.project_id:
-                glidein_params_to_encrypt["ProjectId"] = str(cred.project_id)
+            glidein_params_to_encrypt[req_cred.credential.classad_attribute] = req_cred.credential.id
+            if req_cred.credential.cred_type is CredentialType.SCITOKEN:
+                glidein_params_to_encrypt["frontend_scitoken"] = req_cred.credential.string
+            if isinstance(req_cred.credential, CredentialPair):
+                glidein_params_to_encrypt[req_cred.credential.private_credential.classad_attribute] = req_cred.credential.private_credential.id
 
-            # Add id for the pilot proxy
-            if cred.pilot_fname:
-                glidein_params_to_encrypt["GlideinProxy"] = self.file_id_cache.file_id(cred, cred.pilot_fname)
-
+            # TODO: Use a generator here
             # Add condor token
             ctkn = self.refresh_entry_token(glidein_site)
             if ctkn:
@@ -633,26 +615,16 @@ class GlideFrontendElement:
         self.global_key[glidefactory_classad["CollectorHost"]] = key_obj
 
         # Figure out the credentials to advertise and load them
-        credentials = self.credential_plugin.get_credentials()
-        nr_credentials = len(credentials)
+        nr_credentials = len(self.request_credentials)
         self.logger.info(f"Number of credentials found: {nr_credentials}")
-        for cred in credentials:
-            cred.advertize = True
-            cred.renew()
-            cred.create_if_not_exist()
-            cred.loaded_data = []
-            for cred_file in (cred.filename, cred.key_fname, cred.pilot_fname):
-                self.logger.debug(f"Loading credential file {str(cred_file)}")
-                if cred_file:
-                    cred_data = cred.get_string(cred_file)
-                    if cred_data:
-                        cred.loaded_data.append((cred_file, cred_data))
-                    else:
-                        # We encountered error with this credential
-                        # Move onto next credential
-                        self.logger.info(f"ERROR loading credential file {cred_file}, setting advertize to False")
-                        cred.advertize = False
-                        break
+        for req_cred in self.request_credentials:
+            req_cred.advertize = True
+            req_cred.credential.renew()
+            if not req_cred.credential.valid:
+                req_cred.advertize = False
+                self.logger.warning(
+                    f"Skipping credential {req_cred.credential.id} because it is not valid. Reason: {req_cred.credential.invalid_reason()}"
+                )
 
         # Create GlideClientGlobalClassad object
         my_name = f"{self.frontend_name}.{self.fe_group}"
@@ -668,14 +640,17 @@ class GlideFrontendElement:
             "NumberOfCredentials": f"{nr_credentials}",
             "SecurityName": f"{self.security_name}",
         }
-        for cred in credentials:
-            if cred.advertize:
-                for (fname, data) in cred.loaded_data:
-                    classad_attrs_to_encrypt[cred.file_id(fname)] = data
-                    if hasattr(cred, "security_class"):
+        for req_cred in self.request_credentials:
+            if req_cred.advertize:
+                creds = [req_cred.credential]
+                if hasattr(req_cred, "private_credential"):
+                    creds.append(req_cred.private_credential)
+                for cred in creds:
+                    classad_attrs_to_encrypt[cred.id] = cred.string
+                    if cred.security_class:
                         # Convert security_class to string for factory
                         # to interpret it correctly
-                        classad_attrs_to_encrypt[f"SecurityClass{cred.file_id(fname)}"] = str(cred.security_class)
+                        classad_attrs_to_encrypt[f"SecurityClass{cred.id}"] = str(cred.security_class)
 
         # Add classad attributes that need to be encrypted
         for attr in classad_attrs_to_encrypt:
@@ -749,11 +724,14 @@ class GlideFrontendElement:
         # TODO: Support different credential selection plugins in future
         # credential selection plugin to use
         # cred_plugin => self.x509_proxy_plugin in gwms frontend
-        cred_plugin_name = "ProxyAll"
+        cred_plugin_name = "CredentialsBasic"
         cred_plugin_class = glideinFrontendPlugins.proxy_plugins[cred_plugin_name]
-        cred_list = create_credential_list(group_config["proxies"], group_config, self.logger)
-        self.logger.info(f"Number of credentials found from the configuration {len(cred_list)}")
-        self.credential_plugin = cred_plugin_class(self.workdir, cred_list)
+        security_bundle = SecurityBundle()
+        security_bundle.load_from_element(group_config)
+        self.logger.info(f"Number of credentials found from the configuration {len(security_bundle.credentials)}")
+        self.logger.info(f"Number of parameters found from the configuration {len(security_bundle.parameters)}")
+        self.credential_plugin = cred_plugin_class(self.workdir, security_bundle)
+        self.request_credentials = self.credential_plugin.get_request_credentials()
         self.glidein_config_limits = {}
 
         # Lookup my identity: key = (factory_collector, factory_auth_id)
@@ -859,7 +837,7 @@ class GlideFrontendElement:
             count_entry_slots[request_name] = {}
             count_entry_slots_cred[request_name] = {}
             for cred in self.credential_plugin.cred_list:
-                count_entry_slots_cred[request_name][cred.get_id()] = {}
+                count_entry_slots_cred[request_name][cred.id] = {}
 
             req_entry, req_name, req_fact = request_name.split("@")
 
@@ -902,25 +880,25 @@ class GlideFrontendElement:
                 # Further get counts per credentials
                 for cred in self.credential_plugin.cred_list:
                     # Initialize all counts to 0 for potential empty frames
-                    count_entry_slots_cred[request_name][cred.get_id()][st] = 0
+                    count_entry_slots_cred[request_name][cred.id][st] = 0
                     entry_slots_cred = pandas.DataFrame()
                     if not entry_slot_types[st].empty:
                         entry_slots_cred = entry_slot_types[st].query(
-                            f'GLIDEIN_CredentialIdentifier == "{cred.get_id()}"'
+                            f'GLIDEIN_CredentialIdentifier == "{cred.id}"'
                         )
 
                     if st == "TotalCores":
-                        count_entry_slots_cred[request_name][cred.get_id()][st] = count_total_cores(entry_slots_cred)
+                        count_entry_slots_cred[request_name][cred.id][st] = count_total_cores(entry_slots_cred)
                     elif st == "IdleCores":
-                        count_entry_slots_cred[request_name][cred.get_id()][st] = count_idle_cores(entry_slots_cred)
+                        count_entry_slots_cred[request_name][cred.id][st] = count_idle_cores(entry_slots_cred)
                     elif st == "RunningCores":
-                        count_entry_slots_cred[request_name][cred.get_id()][st] = count_running_cores(entry_slots_cred)
+                        count_entry_slots_cred[request_name][cred.id][st] = count_running_cores(entry_slots_cred)
                     elif st == "Running":
-                        count_entry_slots_cred[request_name][cred.get_id()][st] = len(entry_slots_cred) - len(
+                        count_entry_slots_cred[request_name][cred.id][st] = len(entry_slots_cred) - len(
                             get_running_pslots(entry_slots_cred)
                         )
                     else:
-                        count_entry_slots_cred[request_name][cred.get_id()][st] = len(entry_slots_cred)
+                        count_entry_slots_cred[request_name][cred.id][st] = len(entry_slots_cred)
 
         return (count_entry_slots, count_entry_slots_cred)
 
@@ -1691,11 +1669,11 @@ class GlideFrontendElementFOM(GlideFrontendElement):
             glidein_monitors_per_cred = {}
             creds_with_running = 0
             for cred in self.credential_plugin.cred_list:
-                glidein_monitors_per_cred[cred.get_id()] = {
-                    f"Glideins{t}": count_slots_per_cred[cred.get_id()][t] for t in count_slots
+                glidein_monitors_per_cred[cred.id] = {
+                    f"Glideins{t}": count_slots_per_cred[cred.id][t] for t in count_slots
                 }
-                glidein_monitors_per_cred[cred.get_id()]["ScaledRunning"] = 0
-                if glidein_monitors_per_cred[cred.get_id()]["GlideinsRunning"]:
+                glidein_monitors_per_cred[cred.id]["ScaledRunning"] = 0
+                if glidein_monitors_per_cred[cred.id]["GlideinsRunning"]:
                     creds_with_running += 1
 
             if creds_with_running:
@@ -1703,7 +1681,7 @@ class GlideFrontendElementFOM(GlideFrontendElement):
                 scaled = 0
                 tr = glidein_monitors["Running"]
                 for cred in self.credential_plugin.cred_list:
-                    cred_monitor = glidein_monitors_per_cred[cred.get_id()]
+                    cred_monitor = glidein_monitors_per_cred[cred.id]
                     if cred_monitor["GlideinsRunning"]:
                         # This cred has running, scale them down
                         if (creds_with_running - scaled) == 1:
@@ -1724,9 +1702,9 @@ class GlideFrontendElementFOM(GlideFrontendElement):
 
             # TODO: These two come from glidefactory classad rows how to get it?
             trust_domain = entry_info.get("GLIDEIN_TrustDomain", ["Grid"]).tolist()[0]
-            auth_method = entry_info.get("GLIDEIN_SupportedAuthenticationMethod", ["grid_proxy"]).tolist()[0]
             glidein_site = entry_info.get("GLIDEIN_Site", ["Unknown"]).tolist()[0]
             entry_name = entry_info.get("EntryName", ["Unknown"]).tolist()[0]
+            auth_method = AuthenticationMethod(entry_info.get("GLIDEIN_SupportedAuthenticationMethod", ["grid_proxy"]).tolist()[0])
 
             # Only advertize if there is a valid key for encryption
             if key_obj is not None:
