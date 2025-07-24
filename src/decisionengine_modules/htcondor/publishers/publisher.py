@@ -47,7 +47,9 @@ class HTCondorManifests(Publisher.Publisher, metaclass=abc.ABCMeta):
             constraint = self.invalidate_ads_constraint[collector_host]
             if constraint:
                 ad = classad.ClassAd()
-                ad.update({"MyType": "Query", "TargetType": self.classad_type, "Requirements": classad.ExprTree(constraint)})
+                ad.update(
+                    {"MyType": "Query", "TargetType": self.classad_type, "Requirements": classad.ExprTree(constraint)}
+                )
                 ads = [ad]
                 try:
                     self.logger.info(
